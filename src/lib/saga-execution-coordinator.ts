@@ -1,7 +1,8 @@
 import Rabbit, { Worker } from 'onewallet.library.rabbit';
+import R from 'ramda';
 import { v4 as uuid } from 'uuid';
 
-import { Saga } from './saga';
+import { Saga, SagaOptions } from './saga';
 import logger from './logger';
 
 type WorkerParams = {
@@ -11,6 +12,14 @@ type WorkerParams = {
     args: any[];
   };
 }
+
+type JobParams = {
+  saga: Saga<any[]>;
+  options: SagaOptions;
+  index: number;
+  args: any[];
+  retries: number;
+};
 
 export default class SagaExecutionCoordinator {
   private readonly rabbit: Rabbit;
@@ -26,13 +35,19 @@ export default class SagaExecutionCoordinator {
     this.rabbit = rabbit;
   }
 
-  private addJob(type: 'EXECUTE_ACTION', params: { saga: Saga<any[]>; index: number; args: any[] }): void;
+  private addJob(type: 'EXECUTE_ACTION', params: Omit<JobParams, 'retries'>): void;
 
-  private addJob(type: 'COMPENSATE_ACTION', params: { saga: Saga<any[]>; index: number; args: any[]; retries: number }): void;
+  private addJob(type: 'COMPENSATE_ACTION', params: JobParams): void;
 
-  private addJob(type: 'DELAY_COMPENSATE_ACTION', params: { saga: Saga<any[]>; index: number; args: any[]; retries: number }): void;
+  private addJob(
+    type: 'DELAY_COMPENSATE_ACTION',
+    params: JobParams,
+  ): void;
 
-  private addJob(type: string, params: Record<string, any>) {
+  private addJob(
+    type: string,
+    params: JobParams,
+  ) {
     if (type === 'EXECUTE_ACTION') {
       const job = (() => {
         const id = uuid();
@@ -44,9 +59,7 @@ export default class SagaExecutionCoordinator {
             await execute(...params.args);
           } catch (err) {
             this.addJob('COMPENSATE_ACTION', {
-              saga: params.saga,
-              args: params.args,
-              index: params.index,
+              ...params,
               retries: 0,
             });
             return;
@@ -54,8 +67,7 @@ export default class SagaExecutionCoordinator {
 
           if (params.index < params.saga.actions.length - 1 && !stopping) {
             this.addJob('EXECUTE_ACTION', {
-              saga: params.saga,
-              args: params.args,
+              ...params,
               index: params.index + 1,
             });
           }
@@ -91,8 +103,7 @@ export default class SagaExecutionCoordinator {
 
           if (params.index > 0 && !stopping) {
             this.addJob('COMPENSATE_ACTION', {
-              saga: params.saga,
-              args: params.args,
+              ...params,
               index: params.index - 1,
               retries: 0,
             });
@@ -117,11 +128,13 @@ export default class SagaExecutionCoordinator {
       const job = (() => {
         const id = uuid();
 
+        const { minDelay, maxDelay, factor } = params.options.backoff;
+
+        const delay = Math.floor(Math.min(minDelay * (factor ** params.retries), maxDelay));
+
         const timeout = setTimeout(() => {
 
-        }, 1000);
-
-        clearTimeout(timeout);
+        }, delay);
 
         return {
           id,
@@ -135,13 +148,23 @@ export default class SagaExecutionCoordinator {
     }
   }
 
-  public async registerSaga(saga: Saga<any[]>) {
+  public async registerSaga(saga: Saga<any[]>, opts?: RecursivePartial<SagaOptions>) {
+    const options = R.mergeDeepLeft(opts || {}, {
+      backoff: {
+        minDelay: 10,
+        maxDelay: 10000,
+        factor: 2,
+      },
+      maxRetries: 10,
+    }) as SagaOptions;
+
     const worker = await this.rabbit.createWorker(`saga:${saga.name}`, async ({ type, data }: WorkerParams) => {
       if (type === 'START_SAGA') {
         this.addJob('EXECUTE_ACTION', {
           saga,
           args: data.args,
           index: 0,
+          options,
         });
       }
     });

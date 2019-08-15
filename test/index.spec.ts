@@ -95,7 +95,7 @@ describe('SagaExecutionCoordinator', () => {
       });
     });
 
-    describe('Given A[1] fails and C[1] fails for the first 2 runs', () => {
+    describe.skip('Given A[1] fails and C[1] fails for the first 2 runs', () => {
       before(async function () {
         this.A = R.times(() => sinon.fake.resolves(undefined), 3);
         this.C = R.times(() => sinon.fake.resolves(undefined), 3);

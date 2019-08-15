@@ -1,0 +1,46 @@
+{
+  "name": "onewallet.library.saga",
+  "version": "0.0.0",
+  "description": "Implementation of the Saga pattern",
+  "main": "build/index.js",
+  "scripts": {
+    "lint": "eslint src/**/*.ts",
+    "check": "tsc --noEmit",
+    "clean": "rimraf /build",
+    "build": "npm run clean && tsc",
+    "test": "DEBUG=error*,warn*,info*,verbose* TS_NODE_PROJECT=tsconfig.json TS_NODE_FILES=true mocha ./test/**/*.spec.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Proto-Garage/onewallet.library.saga.git"
+  },
+  "author": "High Output Ventures",
+  "devDependencies": {
+    "@types/chai": "^4.1.7",
+    "@types/mocha": "^5.2.7",
+    "@types/sinon": "^7.0.13",
+    "@typescript-eslint/eslint-plugin": "~1.6.0",
+    "@typescript-eslint/parser": "^1.11.0",
+    "chai": "^4.2.0",
+    "eslint": "^6.0.1",
+    "eslint-config-airbnb-base": "^13.1.0",
+    "eslint-plugin-import": "^2.18.0",
+    "husky": "^2.3.0",
+    "mocha": "^6.1.4",
+    "rimraf": "^2.6.3",
+    "sinon": "^7.4.1",
+    "ts-node": "^8.3.0",
+    "typescript": "^3.5.3"
+  },
+  "dependencies": {
+    "@types/mongoose": "^5.5.12",
+    "@types/ramda": "^0.26.16",
+    "@types/uuid": "^3.4.5",
+    "highoutput-utilities": "0.0.10",
+    "mongoose": "^5.6.9",
+    "onewallet.library.error": "git+https://git@github.com/Proto-Garage/onewallet.library.error.git#semver:~v0.6.0",
+    "onewallet.library.rabbit": "git+https://git@github.com/Proto-Garage/onewallet.library.rabbit.git#semver:~v0.8.2",
+    "ramda": "^0.26.1",
+    "uuid": "^3.3.2"
+  }
+}

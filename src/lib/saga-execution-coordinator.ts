@@ -3,7 +3,7 @@ import R from 'ramda';
 import { v4 as uuid } from 'uuid';
 
 import { Saga, SagaOptions } from './saga';
-import logger from './logger';
+import calculateBackoffDelay from './calculate-backoff-delay';
 
 type WorkerParams = {
   type: 'START_SAGA';
@@ -97,7 +97,12 @@ export default class SagaExecutionCoordinator {
           try {
             await compensate(...params.args);
           } catch (err) {
-            logger.warn(err);
+            if (params.retries < params.options.maxRetries) {
+              this.addJob('DELAY_COMPENSATE_ACTION', {
+                ...params,
+                retries: params.retries + 1,
+              });
+            }
             return;
           }
 
@@ -128,12 +133,10 @@ export default class SagaExecutionCoordinator {
       const job = (() => {
         const id = uuid();
 
-        const { minDelay, maxDelay, factor } = params.options.backoff;
-
-        const delay = Math.floor(Math.min(minDelay * (factor ** params.retries), maxDelay));
+        const delay = calculateBackoffDelay(params.options.backoff, params.retries);
 
         const timeout = setTimeout(() => {
-
+          this.addJob('COMPENSATE_ACTION', params);
         }, delay);
 
         return {

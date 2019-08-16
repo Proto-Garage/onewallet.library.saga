@@ -1,11 +1,12 @@
 import Rabbit from 'onewallet.library.rabbit';
-import { Saga } from './saga';
+import { Saga, SagaOptions } from './saga';
 export default class SagaExecutionCoordinator {
     private readonly rabbit;
-    private readonly workers;
-    private readonly sagas;
+    private readonly registeredSagas;
+    private readonly jobs;
     constructor(rabbit: Rabbit);
-    registerSaga<T extends any[] = [Record<string, any>]>(saga: Saga<T>): Promise<void>;
+    private addJob;
+    registerSaga(saga: Saga<any[]>, opts?: RecursivePartial<SagaOptions>): Promise<void>;
     stop(): Promise<void>;
 }
 //# sourceMappingURL=saga-execution-coordinator.d.ts.map

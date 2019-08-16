@@ -5,12 +5,13 @@ export declare type SagaAction<T extends any[]> = {
 export declare type Saga<T extends any[] = [Record<string, any>]> = {
     name: string;
     actions: SagaAction<T>[];
-    options?: {
-        backoff?: {
-            minDelay?: number;
-            maxDelay?: number;
-        };
-        maxRetries?: number;
+};
+export declare type SagaOptions = {
+    backoff: {
+        minDelay: number;
+        maxDelay: number;
+        factor: number;
     };
+    maxRetries: number;
 };
 //# sourceMappingURL=saga.d.ts.map

@@ -25,7 +25,7 @@ const createFakeCoordinator = async (
     }))(sagaActions.length),
   };
 
-  await coordinator.registerSaga(saga);
+  await coordinator.registerSaga(saga, { backoff: { minDelay: 1 } });
 
   return coordinator;
 };
@@ -71,6 +71,7 @@ describe('SagaExecutionCoordinator', () => {
 
         const client = new SagaExecutionClient<[{ value: number }]>(rabbit, 'TestSaga');
         await client.execute({ value: Math.random() });
+        await delay(100);
       });
 
       after(async function () {
@@ -103,23 +104,24 @@ describe('SagaExecutionCoordinator', () => {
         this.C[1] = (() => {
           let counter = 0;
 
-          return async () => {
+          return sinon.fake(async () => {
+            counter += 1;
+
             if (counter < 3) {
               throw new Error('Failed');
             }
-
-            counter += 1;
-          };
+          });
         })();
 
         this.coordinator = await createFakeCoordinator(this.A, this.C);
 
         const client = new SagaExecutionClient<[{ value: number }]>(rabbit, 'TestSaga');
         await client.execute({ value: Math.random() });
+        await delay(100);
       });
 
       it('should execute C[1] 3 times', function () {
-        expect(this.C[1].calledThrice).to.be.true;
+        expect(this.C[1].callCount).to.equal(3);
       });
     });
   });

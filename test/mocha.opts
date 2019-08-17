@@ -3,3 +3,4 @@
 --colors
 --require ts-node/register/transpile-only
 --recursive
+--bail

@@ -14,7 +14,9 @@ export default class SagaExecutionClient<T extends any[] = [Record<string, any>]
 
   public async execute(...args: T) {
     if (!this.client) {
-      this.client = this.rabbit.createClient(`saga:${this.saga}`);
+      this.client = this.rabbit.createClient(`saga:${this.saga}`, {
+        noResponse: true,
+      });
     }
 
     const client = await this.client;

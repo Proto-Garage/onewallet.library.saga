@@ -1,4 +1,4 @@
-import Rabbit, { Worker } from 'onewallet.library.rabbit';
+import Rabbit, { Worker, Client } from 'onewallet.library.rabbit';
 import R from 'ramda';
 import { v4 as uuid } from 'uuid';
 
@@ -11,6 +11,13 @@ type WorkerParams = {
     saga: string;
     args: any[];
   };
+} | {
+  type: 'START_ACTION';
+  data: {
+    saga: string;
+    args: any[];
+    index: number;
+  };
 }
 
 type JobParams = {
@@ -22,6 +29,8 @@ type JobParams = {
 };
 
 export default class SagaExecutionCoordinator {
+  private status: 'RUNNING' | 'STOPPING' | 'STOPPED' = 'RUNNING';
+
   private readonly rabbit: Rabbit;
 
   private readonly registeredSagas: Map<string, {
@@ -31,18 +40,33 @@ export default class SagaExecutionCoordinator {
 
   private readonly jobs: Map<string, { id: string; stop: () => Promise<void> }> = new Map();
 
+  private readonly clients: Map<string, Promise<{
+    (...args: any[]): Promise<any>;
+    client: Client;
+  }>> = new Map();
+
   public constructor(rabbit: Rabbit) {
     this.rabbit = rabbit;
+  }
+
+  private async initializeClient(saga: string) {
+    let clientPromise = this.clients.get(saga);
+
+    if (!clientPromise) {
+      clientPromise = this.rabbit.createClient(`saga:${saga}`, {
+        noResponse: true,
+      });
+      this.clients.set(saga, clientPromise);
+    }
+
+    return clientPromise;
   }
 
   private addJob(type: 'EXECUTE_ACTION', params: Omit<JobParams, 'retries'>): void;
 
   private addJob(type: 'COMPENSATE_ACTION', params: JobParams): void;
 
-  private addJob(
-    type: 'DELAY_COMPENSATE_ACTION',
-    params: JobParams,
-  ): void;
+  private addJob(type: 'DELAY_COMPENSATE_ACTION', params: JobParams): void;
 
   private addJob(
     type: string,
@@ -65,11 +89,24 @@ export default class SagaExecutionCoordinator {
             return;
           }
 
-          if (params.index < params.saga.actions.length - 1 && !stopping) {
-            this.addJob('EXECUTE_ACTION', {
-              ...params,
-              index: params.index + 1,
-            });
+          if (params.index < params.saga.actions.length - 1) {
+            if (stopping) {
+              const client = await this.initializeClient(params.saga.name);
+
+              await client({
+                type: 'START_ACTION',
+                data: {
+                  saga: params.saga.name,
+                  args: params.args,
+                  index: params.index + 1,
+                },
+              });
+            } else {
+              this.addJob('EXECUTE_ACTION', {
+                ...params,
+                index: params.index + 1,
+              });
+            }
           }
 
           this.jobs.delete(id);
@@ -161,12 +198,20 @@ export default class SagaExecutionCoordinator {
       maxRetries: 10,
     }) as SagaOptions;
 
-    const worker = await this.rabbit.createWorker(`saga:${saga.name}`, async ({ type, data }: WorkerParams) => {
-      if (type === 'START_SAGA') {
+    const worker = await this.rabbit.createWorker(`saga:${saga.name}`, async (params: WorkerParams) => {
+      if (params.type === 'START_SAGA') {
         this.addJob('EXECUTE_ACTION', {
           saga,
-          args: data.args,
+          args: params.data.args,
           index: 0,
+          options,
+        });
+      }
+      if (params.type === 'START_ACTION') {
+        this.addJob('EXECUTE_ACTION', {
+          saga,
+          args: params.data.args,
+          index: params.data.index,
           options,
         });
       }
@@ -179,8 +224,13 @@ export default class SagaExecutionCoordinator {
   }
 
   public async stop() {
-    await Promise.all(Array.from(this.registeredSagas.values()).map(({ worker }) => worker.stop()));
+    if (this.status !== 'RUNNING') {
+      return;
+    }
 
+    this.status = 'STOPPING';
+    await Promise.all(Array.from(this.registeredSagas.values()).map(({ worker }) => worker.stop()));
     await Promise.all(Array.from(this.jobs.values()).map(item => item.stop()));
+    this.status = 'STOPPED';
   }
 }

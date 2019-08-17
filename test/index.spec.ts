@@ -167,6 +167,62 @@ describe('SagaExecutionCoordinator', () => {
           expect(this.C[2].calledOnce).to.be.false;
         });
       });
+
+      describe('Given multiple coordinators are running', () => {
+        describe('When the active coordinator shuts down', () => {
+          before(async function () {
+            this.A = R.times(() => sinon.fake.resolves(undefined), 3);
+            this.C = R.times(() => sinon.fake.resolves(undefined), 3);
+            this.A[1] = sinon.fake.rejects(new Error('Failed'));
+
+            const deferred = defer();
+            this.coordinators = await Promise.all(R.times(
+              async (index) => {
+                const original = this.C[1];
+                return createFakeCoordinator(this.A, [
+                  this.C[0],
+                  async () => {
+                    deferred.resolve(index);
+                    await delay(50);
+                    await original();
+                  },
+                  this.C[2],
+                ]);
+              },
+              10,
+            ));
+
+            const client = new SagaExecutionClient<[{ value: number }]>(rabbit, 'TestSaga');
+            await client.execute({ value: Math.random() });
+
+            const coordinator = this.coordinators[(await deferred.promise) as number];
+            await coordinator.stop();
+
+            await delay(50);
+          });
+
+          after(async function () {
+            await Promise.all(this.coordinators.map(item => item.stop()));
+          });
+
+          it('should execute A[0]', function () {
+            expect(this.A[0].calledOnce).to.be.true;
+          });
+
+          it('should not execute A[2]', function () {
+            expect(this.A[2].calledOnce).to.be.false;
+          });
+
+          it('should execute C[0] and C[1]', function () {
+            expect(this.C[0].calledOnce).to.be.true;
+            expect(this.C[1].calledOnce).to.be.true;
+          });
+
+          it('should not execute C[2]', function () {
+            expect(this.C[2].calledOnce).to.be.false;
+          });
+        });
+      });
     });
 
     describe('Given A[1] fails and C[1] fails for the first 2 runs', () => {

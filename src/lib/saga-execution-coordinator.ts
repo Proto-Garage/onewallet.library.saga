@@ -4,6 +4,7 @@ import { v4 as uuid } from 'uuid';
 
 import { Saga, SagaOptions } from './saga';
 import calculateBackoffDelay from './calculate-backoff-delay';
+import defer from './defer';
 
 type WorkerParams = {
   type: 'START_SAGA';
@@ -18,18 +19,40 @@ type WorkerParams = {
     args: any[];
     index: number;
   };
+} | {
+  type: 'COMPENSATE_ACTION';
+  data: {
+    saga: string;
+    args: any[];
+    index: number;
+    retries: number;
+  };
+} | {
+  type: 'DELAY_COMPENSATE_ACTION';
+  data: {
+    saga: string;
+    args: any[];
+    index: number;
+    retries: number;
+    schedule: number;
+  };
 }
 
-type JobParams = {
+type CommonJobParams = {
   saga: Saga<any[]>;
   options: SagaOptions;
   index: number;
   args: any[];
-  retries: number;
 };
 
+export enum SagaExecutionCoordinatorStatus {
+  Running,
+  Stopping,
+  Stopped,
+}
+
 export default class SagaExecutionCoordinator {
-  private status: 'RUNNING' | 'STOPPING' | 'STOPPED' = 'RUNNING';
+  private status: SagaExecutionCoordinatorStatus = SagaExecutionCoordinatorStatus.Running;
 
   private readonly rabbit: Rabbit;
 
@@ -56,21 +79,22 @@ export default class SagaExecutionCoordinator {
       clientPromise = this.rabbit.createClient(`saga:${saga}`, {
         noResponse: true,
       });
+
       this.clients.set(saga, clientPromise);
     }
 
     return clientPromise;
   }
 
-  private addJob(type: 'EXECUTE_ACTION', params: Omit<JobParams, 'retries'>): void;
+  private addJob(type: 'EXECUTE_ACTION', params: CommonJobParams): void;
 
-  private addJob(type: 'COMPENSATE_ACTION', params: JobParams): void;
+  private addJob(type: 'COMPENSATE_ACTION', params: CommonJobParams & { retries: number }): void;
 
-  private addJob(type: 'DELAY_COMPENSATE_ACTION', params: JobParams): void;
+  private addJob(type: 'DELAY_COMPENSATE_ACTION', params: CommonJobParams & { retries: number; schedule: number }): void;
 
   private addJob(
     type: string,
-    params: JobParams,
+    params: CommonJobParams & { retries: number; schedule: number },
   ) {
     if (type === 'EXECUTE_ACTION') {
       const job = (() => {
@@ -138,17 +162,36 @@ export default class SagaExecutionCoordinator {
               this.addJob('DELAY_COMPENSATE_ACTION', {
                 ...params,
                 retries: params.retries + 1,
+                schedule: Date.now()
+                  + calculateBackoffDelay(params.options.backoff, params.retries + 1),
               });
+            } else {
+              throw Error('Maximum number of retries reached.');
             }
+
             return;
           }
 
-          if (params.index > 0 && !stopping) {
-            this.addJob('COMPENSATE_ACTION', {
-              ...params,
-              index: params.index - 1,
-              retries: 0,
-            });
+          if (params.index > 0) {
+            if (stopping) {
+              const client = await this.initializeClient(params.saga.name);
+
+              await client({
+                type: 'COMPENSATE_ACTION',
+                data: {
+                  saga: params.saga.name,
+                  args: params.args,
+                  index: params.index - 1,
+                  retries: 0,
+                },
+              });
+            } else {
+              this.addJob('COMPENSATE_ACTION', {
+                ...params,
+                index: params.index - 1,
+                retries: 0,
+              });
+            }
           }
 
           this.jobs.delete(id);
@@ -169,17 +212,47 @@ export default class SagaExecutionCoordinator {
     if (type === 'DELAY_COMPENSATE_ACTION') {
       const job = (() => {
         const id = uuid();
+        let stopping = false;
 
-        const delay = calculateBackoffDelay(params.options.backoff, params.retries);
+        const delay = Math.max(params.schedule - Date.now(), 0);
 
-        const timeout = setTimeout(() => {
-          this.addJob('COMPENSATE_ACTION', params);
+        const deferred = defer();
+        const timeout = setTimeout(async () => {
+          deferred.resolve();
+          if (stopping) {
+            const client = await this.initializeClient(params.saga.name);
+
+            await client({
+              type: 'COMPENSATE_ACTION',
+              data: {
+                ...R.pick(['args', 'index', 'retries'], params),
+                saga: params.saga.name,
+              },
+            });
+          } else {
+            this.addJob('COMPENSATE_ACTION', R.omit(['schedule'], params));
+          }
         }, delay);
 
         return {
           id,
           stop: async () => {
-            clearTimeout(timeout);
+            stopping = true;
+            const remaining = Math.max(params.schedule - Date.now(), 0);
+            if (remaining < 5000) {
+              await deferred.promise;
+            } else {
+              clearTimeout(timeout);
+              const client = await this.initializeClient(params.saga.name);
+
+              await client({
+                type: 'DELAY_COMPENSATE_ACTION',
+                data: {
+                  ...R.pick(['args', 'index', 'retries', 'schedule'], params),
+                  saga: params.saga.name,
+                },
+              });
+            }
           },
         };
       })();
@@ -201,17 +274,32 @@ export default class SagaExecutionCoordinator {
     const worker = await this.rabbit.createWorker(`saga:${saga.name}`, async (params: WorkerParams) => {
       if (params.type === 'START_SAGA') {
         this.addJob('EXECUTE_ACTION', {
-          saga,
           args: params.data.args,
-          index: 0,
+          saga,
           options,
+          index: 0,
         });
       }
       if (params.type === 'START_ACTION') {
         this.addJob('EXECUTE_ACTION', {
+          ...R.pick(['args', 'index'], params.data),
           saga,
-          args: params.data.args,
-          index: params.data.index,
+          options,
+        });
+      }
+
+      if (params.type === 'COMPENSATE_ACTION') {
+        this.addJob('COMPENSATE_ACTION', {
+          ...R.pick(['args', 'index', 'retries'], params.data),
+          saga,
+          options,
+        });
+      }
+
+      if (params.type === 'DELAY_COMPENSATE_ACTION') {
+        this.addJob('DELAY_COMPENSATE_ACTION', {
+          ...R.pick(['args', 'index', 'retries', 'schedule'], params.data),
+          saga,
           options,
         });
       }
@@ -224,13 +312,13 @@ export default class SagaExecutionCoordinator {
   }
 
   public async stop() {
-    if (this.status !== 'RUNNING') {
+    if (this.status !== SagaExecutionCoordinatorStatus.Running) {
       return;
     }
 
-    this.status = 'STOPPING';
+    this.status = SagaExecutionCoordinatorStatus.Stopping;
     await Promise.all(Array.from(this.registeredSagas.values()).map(({ worker }) => worker.stop()));
     await Promise.all(Array.from(this.jobs.values()).map(item => item.stop()));
-    this.status = 'STOPPED';
+    this.status = SagaExecutionCoordinatorStatus.Stopped;
   }
 }

@@ -6,22 +6,37 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const ramda_1 = __importDefault(require("ramda"));
 const uuid_1 = require("uuid");
 const calculate_backoff_delay_1 = __importDefault(require("./calculate-backoff-delay"));
-const l = {
-    p1: '',
-    p2: {
-        p4: 'hello',
-    },
-    p3: [{ p5: '', p6: '' }],
-};
-console.log(l);
+const defer_1 = __importDefault(require("./defer"));
+const saga_log_store_1 = require("./saga-log-store");
+var SagaExecutionCoordinatorStatus;
+(function (SagaExecutionCoordinatorStatus) {
+    SagaExecutionCoordinatorStatus[SagaExecutionCoordinatorStatus["Running"] = 0] = "Running";
+    SagaExecutionCoordinatorStatus[SagaExecutionCoordinatorStatus["Stopping"] = 1] = "Stopping";
+    SagaExecutionCoordinatorStatus[SagaExecutionCoordinatorStatus["Stopped"] = 2] = "Stopped";
+})(SagaExecutionCoordinatorStatus = exports.SagaExecutionCoordinatorStatus || (exports.SagaExecutionCoordinatorStatus = {}));
 class SagaExecutionCoordinator {
-    constructor(rabbit) {
+    constructor(rabbit, sagaLogStore) {
+        this.status = SagaExecutionCoordinatorStatus.Running;
         this.registeredSagas = new Map();
         this.jobs = new Map();
+        this.clients = new Map();
         this.rabbit = rabbit;
+        this.sagaLogStore = sagaLogStore || {
+            createLog: () => Promise.resolve(),
+        };
+    }
+    async initializeClient(saga) {
+        let clientPromise = this.clients.get(saga);
+        if (!clientPromise) {
+            clientPromise = this.rabbit.createClient(`saga:${saga}`, {
+                noResponse: true,
+            });
+            this.clients.set(saga, clientPromise);
+        }
+        return clientPromise;
     }
     addJob(type, params) {
-        if (type === 'EXECUTE_ACTION') {
+        if (type === saga_log_store_1.SagaLogType.StartAction) {
             const job = (() => {
                 const id = uuid_1.v4();
                 let stopping = false;
@@ -31,11 +46,17 @@ class SagaExecutionCoordinator {
                         await execute(...params.args);
                     }
                     catch (err) {
-                        this.addJob('COMPENSATE_ACTION', Object.assign({}, params, { retries: 0 }));
+                        this.addJob(saga_log_store_1.SagaLogType.StartCompensateAction, Object.assign({}, params, { retries: 0 }));
                         return;
                     }
-                    if (params.index < params.saga.actions.length - 1 && !stopping) {
-                        this.addJob('EXECUTE_ACTION', Object.assign({}, params, { index: params.index + 1 }));
+                    if (params.index < params.saga.actions.length - 1) {
+                        if (stopping) {
+                            const client = await this.initializeClient(params.saga.name);
+                            await client(Object.assign({}, ramda_1.default.pick(['eid', 'args'])(params), { type: saga_log_store_1.SagaLogType.StartAction, saga: params.saga.name, index: params.index + 1 }));
+                        }
+                        else {
+                            this.addJob(saga_log_store_1.SagaLogType.StartAction, Object.assign({}, params, { index: params.index + 1 }));
+                        }
                     }
                     this.jobs.delete(id);
                 })();
@@ -49,7 +70,7 @@ class SagaExecutionCoordinator {
             })();
             this.jobs.set(job.id, job);
         }
-        if (type === 'COMPENSATE_ACTION') {
+        if (type === saga_log_store_1.SagaLogType.StartCompensateAction) {
             const job = (() => {
                 const id = uuid_1.v4();
                 let stopping = false;
@@ -60,12 +81,22 @@ class SagaExecutionCoordinator {
                     }
                     catch (err) {
                         if (params.retries < params.options.maxRetries) {
-                            this.addJob('DELAY_COMPENSATE_ACTION', Object.assign({}, params, { retries: params.retries + 1 }));
+                            this.addJob(saga_log_store_1.SagaLogType.DelayCompensateAction, Object.assign({}, params, { retries: params.retries + 1, schedule: Date.now()
+                                    + calculate_backoff_delay_1.default(params.options.backoff, params.retries + 1) }));
+                        }
+                        else {
+                            throw Error('Maximum number of retries reached.');
                         }
                         return;
                     }
-                    if (params.index > 0 && !stopping) {
-                        this.addJob('COMPENSATE_ACTION', Object.assign({}, params, { index: params.index - 1, retries: 0 }));
+                    if (params.index > 0) {
+                        if (stopping) {
+                            const client = await this.initializeClient(params.saga.name);
+                            await client(Object.assign({}, ramda_1.default.pick(['eid', 'args'])(params), { type: saga_log_store_1.SagaLogType.StartCompensateAction, saga: params.saga.name, index: params.index - 1, retries: 0 }));
+                        }
+                        else {
+                            this.addJob(saga_log_store_1.SagaLogType.StartCompensateAction, Object.assign({}, params, { index: params.index - 1, retries: 0 }));
+                        }
                     }
                     this.jobs.delete(id);
                 })();
@@ -79,17 +110,35 @@ class SagaExecutionCoordinator {
             })();
             this.jobs.set(job.id, job);
         }
-        if (type === 'DELAY_COMPENSATE_ACTION') {
+        if (type === saga_log_store_1.SagaLogType.DelayCompensateAction) {
             const job = (() => {
                 const id = uuid_1.v4();
-                const delay = calculate_backoff_delay_1.default(params.options.backoff, params.retries);
-                const timeout = setTimeout(() => {
-                    this.addJob('COMPENSATE_ACTION', params);
+                let stopping = false;
+                const delay = Math.max(params.schedule - Date.now(), 0);
+                const deferred = defer_1.default();
+                const timeout = setTimeout(async () => {
+                    deferred.resolve();
+                    if (stopping) {
+                        const client = await this.initializeClient(params.saga.name);
+                        await client(Object.assign({}, ramda_1.default.pick(['eid', 'args', 'index', 'retries'])(params), { type: saga_log_store_1.SagaLogType.StartCompensateAction, saga: params.saga.name }));
+                    }
+                    else {
+                        this.addJob(saga_log_store_1.SagaLogType.StartCompensateAction, ramda_1.default.omit(['schedule'], params));
+                    }
                 }, delay);
                 return {
                     id,
                     stop: async () => {
-                        clearTimeout(timeout);
+                        stopping = true;
+                        const remaining = Math.max(params.schedule - Date.now(), 0);
+                        if (remaining < 5000) {
+                            await deferred.promise;
+                        }
+                        else {
+                            clearTimeout(timeout);
+                            const client = await this.initializeClient(params.saga.name);
+                            await client(Object.assign({}, ramda_1.default.pick(['eid', 'args', 'index', 'retries', 'schedule'], params), { type: saga_log_store_1.SagaLogType.DelayCompensateAction, saga: params.saga.name }));
+                        }
                     },
                 };
             })();
@@ -105,14 +154,23 @@ class SagaExecutionCoordinator {
             },
             maxRetries: 10,
         });
-        const worker = await this.rabbit.createWorker(`saga:${saga.name}`, async ({ type, data }) => {
-            if (type === 'START_SAGA') {
-                this.addJob('EXECUTE_ACTION', {
-                    saga,
-                    args: data.args,
-                    index: 0,
-                    options,
-                });
+        const worker = await this.rabbit.createWorker(`saga:${saga.name}`, async (params) => {
+            if (params.type === saga_log_store_1.SagaLogType.StartSaga) {
+                this.sagaLogStore.createLog(params);
+                this.addJob(saga_log_store_1.SagaLogType.StartAction, Object.assign({}, ramda_1.default.pick(['eid', 'args'])(params), { saga,
+                    options, index: 0 }));
+            }
+            if (params.type === saga_log_store_1.SagaLogType.StartAction) {
+                this.addJob(saga_log_store_1.SagaLogType.StartAction, Object.assign({}, ramda_1.default.pick(['eid', 'args', 'index'], params), { saga,
+                    options }));
+            }
+            if (params.type === saga_log_store_1.SagaLogType.StartCompensateAction) {
+                this.addJob(saga_log_store_1.SagaLogType.StartCompensateAction, Object.assign({}, ramda_1.default.pick(['eid', 'args', 'index', 'retries'], params), { saga,
+                    options }));
+            }
+            if (params.type === saga_log_store_1.SagaLogType.DelayCompensateAction) {
+                this.addJob(saga_log_store_1.SagaLogType.DelayCompensateAction, Object.assign({}, ramda_1.default.pick(['eid', 'args', 'index', 'retries', 'schedule'], params), { saga,
+                    options }));
             }
         });
         this.registeredSagas.set(saga.name, {
@@ -121,8 +179,13 @@ class SagaExecutionCoordinator {
         });
     }
     async stop() {
+        if (this.status !== SagaExecutionCoordinatorStatus.Running) {
+            return;
+        }
+        this.status = SagaExecutionCoordinatorStatus.Stopping;
         await Promise.all(Array.from(this.registeredSagas.values()).map(({ worker }) => worker.stop()));
         await Promise.all(Array.from(this.jobs.values()).map(item => item.stop()));
+        this.status = SagaExecutionCoordinatorStatus.Stopped;
     }
 }
 exports.default = SagaExecutionCoordinator;

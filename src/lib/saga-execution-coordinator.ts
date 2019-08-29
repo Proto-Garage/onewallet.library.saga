@@ -5,40 +5,30 @@ import { v4 as uuid } from 'uuid';
 import { Saga, SagaOptions } from './saga';
 import calculateBackoffDelay from './calculate-backoff-delay';
 import defer from './defer';
+import { SagaLogStore, SagaLogType } from './saga-log-store';
 
 type WorkerParams = {
-  type: 'START_SAGA';
-  data: {
-    saga: string;
-    args: any[];
-  };
+  eid: string;
+  saga: string;
+  args: any[];
+} & ({
+  type: SagaLogType.StartSaga;
 } | {
-  type: 'START_ACTION';
-  data: {
-    saga: string;
-    args: any[];
-    index: number;
-  };
+  type: SagaLogType.StartAction;
+  index: number;
 } | {
-  type: 'COMPENSATE_ACTION';
-  data: {
-    saga: string;
-    args: any[];
-    index: number;
-    retries: number;
-  };
+  type: SagaLogType.StartCompensateAction;
+  index: number;
+  retries: number;
 } | {
-  type: 'DELAY_COMPENSATE_ACTION';
-  data: {
-    saga: string;
-    args: any[];
-    index: number;
-    retries: number;
-    schedule: number;
-  };
-}
+  type: SagaLogType.DelayCompensateAction;
+  index: number;
+  retries: number;
+  schedule: number;
+});
 
 type CommonJobParams = {
+  eid: string;
   saga: Saga<any[]>;
   options: SagaOptions;
   index: number;
@@ -63,16 +53,21 @@ export default class SagaExecutionCoordinator {
 
   private readonly jobs: Map<string, { id: string; stop: () => Promise<void> }> = new Map();
 
+  private readonly sagaLogStore: SagaLogStore;
+
   private readonly clients: Map<string, Promise<{
     (...args: any[]): Promise<any>;
     client: Client;
   }>> = new Map();
 
-  public constructor(rabbit: Rabbit) {
+  public constructor(rabbit: Rabbit, sagaLogStore?: SagaLogStore) {
     this.rabbit = rabbit;
+    this.sagaLogStore = sagaLogStore || {
+      createLog: () => Promise.resolve(),
+    };
   }
 
-  private async initializeClient(saga: string) {
+  private async initializeClient(saga: string): Promise<(params: WorkerParams) => Promise<void>> {
     let clientPromise = this.clients.get(saga);
 
     if (!clientPromise) {
@@ -86,17 +81,26 @@ export default class SagaExecutionCoordinator {
     return clientPromise;
   }
 
-  private addJob(type: 'EXECUTE_ACTION', params: CommonJobParams): void;
+  private addJob(
+    type: SagaLogType.StartAction,
+    params: CommonJobParams,
+  ): void;
 
-  private addJob(type: 'COMPENSATE_ACTION', params: CommonJobParams & { retries: number }): void;
+  private addJob(
+    type: SagaLogType.StartCompensateAction,
+    params: CommonJobParams & { retries: number },
+  ): void;
 
-  private addJob(type: 'DELAY_COMPENSATE_ACTION', params: CommonJobParams & { retries: number; schedule: number }): void;
+  private addJob(
+    type: SagaLogType.DelayCompensateAction,
+    params: CommonJobParams & { retries: number; schedule: number },
+  ): void;
 
   private addJob(
     type: string,
     params: CommonJobParams & { retries: number; schedule: number },
   ) {
-    if (type === 'EXECUTE_ACTION') {
+    if (type === SagaLogType.StartAction) {
       const job = (() => {
         const id = uuid();
         let stopping = false;
@@ -104,9 +108,21 @@ export default class SagaExecutionCoordinator {
         const promise = (async () => {
           const { execute } = params.saga.actions[params.index];
           try {
+            await this.sagaLogStore.createLog({
+              ...R.pick(['eid', 'index'])(params),
+              type: SagaLogType.StartAction,
+              saga: params.saga.name,
+            });
+
             await execute(...params.args);
+
+            await this.sagaLogStore.createLog({
+              ...R.pick(['eid', 'index'])(params),
+              type: SagaLogType.EndAction,
+              saga: params.saga.name,
+            });
           } catch (err) {
-            this.addJob('COMPENSATE_ACTION', {
+            this.addJob(SagaLogType.StartCompensateAction, {
               ...params,
               retries: 0,
             });
@@ -118,15 +134,13 @@ export default class SagaExecutionCoordinator {
               const client = await this.initializeClient(params.saga.name);
 
               await client({
-                type: 'START_ACTION',
-                data: {
-                  saga: params.saga.name,
-                  args: params.args,
-                  index: params.index + 1,
-                },
+                ...R.pick(['eid', 'args'])(params),
+                type: SagaLogType.StartAction,
+                saga: params.saga.name,
+                index: params.index + 1,
               });
             } else {
-              this.addJob('EXECUTE_ACTION', {
+              this.addJob(SagaLogType.StartAction, {
                 ...params,
                 index: params.index + 1,
               });
@@ -148,7 +162,7 @@ export default class SagaExecutionCoordinator {
       this.jobs.set(job.id, job);
     }
 
-    if (type === 'COMPENSATE_ACTION') {
+    if (type === SagaLogType.StartCompensateAction) {
       const job = (() => {
         const id = uuid();
         let stopping = false;
@@ -156,10 +170,22 @@ export default class SagaExecutionCoordinator {
         const promise = (async () => {
           const { compensate } = params.saga.actions[params.index];
           try {
+            await this.sagaLogStore.createLog({
+              ...R.pick(['eid', 'index', 'retries'])(params),
+              type: SagaLogType.StartCompensateAction,
+              saga: params.saga.name,
+            });
+
             await compensate(...params.args);
+
+            await this.sagaLogStore.createLog({
+              ...R.pick(['eid', 'index', 'retries'])(params),
+              type: SagaLogType.EndCompensateAction,
+              saga: params.saga.name,
+            });
           } catch (err) {
             if (params.retries < params.options.maxRetries) {
-              this.addJob('DELAY_COMPENSATE_ACTION', {
+              this.addJob(SagaLogType.DelayCompensateAction, {
                 ...params,
                 retries: params.retries + 1,
                 schedule: Date.now()
@@ -177,16 +203,14 @@ export default class SagaExecutionCoordinator {
               const client = await this.initializeClient(params.saga.name);
 
               await client({
-                type: 'COMPENSATE_ACTION',
-                data: {
-                  saga: params.saga.name,
-                  args: params.args,
-                  index: params.index - 1,
-                  retries: 0,
-                },
+                ...R.pick(['eid', 'args'])(params),
+                type: SagaLogType.StartCompensateAction,
+                saga: params.saga.name,
+                index: params.index - 1,
+                retries: 0,
               });
             } else {
-              this.addJob('COMPENSATE_ACTION', {
+              this.addJob(SagaLogType.StartCompensateAction, {
                 ...params,
                 index: params.index - 1,
                 retries: 0,
@@ -209,7 +233,7 @@ export default class SagaExecutionCoordinator {
       this.jobs.set(job.id, job);
     }
 
-    if (type === 'DELAY_COMPENSATE_ACTION') {
+    if (type === SagaLogType.DelayCompensateAction) {
       const job = (() => {
         const id = uuid();
         let stopping = false;
@@ -223,14 +247,12 @@ export default class SagaExecutionCoordinator {
             const client = await this.initializeClient(params.saga.name);
 
             await client({
-              type: 'COMPENSATE_ACTION',
-              data: {
-                ...R.pick(['args', 'index', 'retries'], params),
-                saga: params.saga.name,
-              },
+              ...R.pick(['eid', 'args', 'index', 'retries'])(params),
+              type: SagaLogType.StartCompensateAction,
+              saga: params.saga.name,
             });
           } else {
-            this.addJob('COMPENSATE_ACTION', R.omit(['schedule'], params));
+            this.addJob(SagaLogType.StartCompensateAction, R.omit(['schedule'], params));
           }
         }, delay);
 
@@ -246,11 +268,9 @@ export default class SagaExecutionCoordinator {
               const client = await this.initializeClient(params.saga.name);
 
               await client({
-                type: 'DELAY_COMPENSATE_ACTION',
-                data: {
-                  ...R.pick(['args', 'index', 'retries', 'schedule'], params),
-                  saga: params.saga.name,
-                },
+                ...R.pick(['eid', 'args', 'index', 'retries', 'schedule'], params),
+                type: SagaLogType.DelayCompensateAction,
+                saga: params.saga.name,
               });
             }
           },
@@ -272,33 +292,35 @@ export default class SagaExecutionCoordinator {
     }) as SagaOptions;
 
     const worker = await this.rabbit.createWorker(`saga:${saga.name}`, async (params: WorkerParams) => {
-      if (params.type === 'START_SAGA') {
-        this.addJob('EXECUTE_ACTION', {
-          args: params.data.args,
+      if (params.type === SagaLogType.StartSaga) {
+        this.sagaLogStore.createLog(params);
+
+        this.addJob(SagaLogType.StartAction, {
+          ...R.pick(['eid', 'args'])(params),
           saga,
           options,
           index: 0,
         });
       }
-      if (params.type === 'START_ACTION') {
-        this.addJob('EXECUTE_ACTION', {
-          ...R.pick(['args', 'index'], params.data),
+      if (params.type === SagaLogType.StartAction) {
+        this.addJob(SagaLogType.StartAction, {
+          ...R.pick(['eid', 'args', 'index'], params),
           saga,
           options,
         });
       }
 
-      if (params.type === 'COMPENSATE_ACTION') {
-        this.addJob('COMPENSATE_ACTION', {
-          ...R.pick(['args', 'index', 'retries'], params.data),
+      if (params.type === SagaLogType.StartCompensateAction) {
+        this.addJob(SagaLogType.StartCompensateAction, {
+          ...R.pick(['eid', 'args', 'index', 'retries'], params),
           saga,
           options,
         });
       }
 
-      if (params.type === 'DELAY_COMPENSATE_ACTION') {
-        this.addJob('DELAY_COMPENSATE_ACTION', {
-          ...R.pick(['args', 'index', 'retries', 'schedule'], params.data),
+      if (params.type === SagaLogType.DelayCompensateAction) {
+        this.addJob(SagaLogType.DelayCompensateAction, {
+          ...R.pick(['eid', 'args', 'index', 'retries', 'schedule'], params),
           saga,
           options,
         });

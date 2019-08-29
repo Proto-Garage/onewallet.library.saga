@@ -1,6 +1,6 @@
 {
   "name": "onewallet.library.saga",
-  "version": "0.1.0-rc.0",
+  "version": "0.1.0-rc.1",
   "description": "Implementation of the Saga pattern",
   "main": "build/index.js",
   "scripts": {

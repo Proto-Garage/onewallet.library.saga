@@ -38,7 +38,7 @@
     "@types/ramda": "^0.26.19",
     "@types/uuid": "^3.4.5",
     "highoutput-utilities": "0.0.10",
-    "mongoose": "^5.6.9",
+    "mongoose": "^5.7.5",
     "onewallet.library.error": "git+https://git@github.com/Proto-Garage/onewallet.library.error.git#semver:~v0.6.0",
     "onewallet.library.rabbit": "git+https://git@github.com/Proto-Garage/onewallet.library.rabbit.git#semver:~v0.8.2",
     "ramda": "^0.26.1",
